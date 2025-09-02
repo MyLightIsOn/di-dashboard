@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { CHART_CATALOG } from "@/lib/chartRegistry";
+import { CHART_CATALOG } from "@/lib/chartCatalog";
 
 const PROVIDER = process.env.LLM_PROVIDER || "openai";
 const MODEL =
