@@ -19,13 +19,20 @@ export type QuerySpec = {
 
 export type DataRow = Record<string, any>;
 
-export type ChartKind = "line" | "bar" | "stackedBar" | "heatmap";
+export type ChartKind =
+  | "line"
+  | "bar"
+  | "stackedBar"
+  | "heatmap"
+  | "stackedArea"
+  | "scatter"
+  | "pie";
 
 export type ChartConfig = {
   kind: ChartKind;
   x: string;
   y: string;
   series?: string; // e.g. region for multi-series line
-  data: DataRow[];
+  data?: DataRow[];
   title: string;
 };
