@@ -1,10 +1,25 @@
 import { NextRequest, NextResponse } from "next/server";
 import { supabase } from "@/lib/supabaseClient"; // <- make sure this exists
-import { computeChecks } from "@/lib/checks";     // uses your existing checks.ts
-import { buildInsights } from "@/lib/insights";   // uses your existing insights.ts
+import { computeChecks } from "@/lib/checks"; // uses your existing checks.ts
+import { buildInsights } from "@/lib/insights"; // uses your existing insights.ts
 import type { QuerySpec, ChartConfig } from "@/types";
 
 const TABLE = process.env.NEXT_PUBLIC_SUPABASE_TABLE || "sales_fact_rows";
+
+function expandRegionShorthand(value: string): string[] {
+  const v = String(value || "").toLowerCase();
+  if (v === "asia" || v === "apac" || v === "asia pacific") {
+    return ["Greater China", "Japan", "Rest of Asia Pacific"];
+  }
+  if (v === "europe" || v === "eu") {
+    // tailor to your dataset
+    return ["Europe"]; // or expand to country-level if you actually store countries as region—most likely keep as "Europe"
+  }
+  if (v === "americas" || v === "na" || v === "latam") {
+    return ["Americas"]; // keep at your region granularity
+  }
+  return [value];
+}
 
 /**
  * Derive geo fields from your mixed "state" column:
@@ -14,7 +29,57 @@ const TABLE = process.env.NEXT_PUBLIC_SUPABASE_TABLE || "sales_fact_rows";
  */
 function deriveGeo(row: any) {
   const US = new Set([
-    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","IA","ID","IL","IN","KS","KY","LA","MA","MD","ME","MI","MN","MO","MS","MT","NC","ND","NE","NH","NJ","NM","NV","NY","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VA","VT","WA","WI","WV","WY","DC",
+    "AL",
+    "AK",
+    "AZ",
+    "AR",
+    "CA",
+    "CO",
+    "CT",
+    "DE",
+    "FL",
+    "GA",
+    "HI",
+    "IA",
+    "ID",
+    "IL",
+    "IN",
+    "KS",
+    "KY",
+    "LA",
+    "MA",
+    "MD",
+    "ME",
+    "MI",
+    "MN",
+    "MO",
+    "MS",
+    "MT",
+    "NC",
+    "ND",
+    "NE",
+    "NH",
+    "NJ",
+    "NM",
+    "NV",
+    "NY",
+    "OH",
+    "OK",
+    "OR",
+    "PA",
+    "RI",
+    "SC",
+    "SD",
+    "TN",
+    "TX",
+    "UT",
+    "VA",
+    "VT",
+    "WA",
+    "WI",
+    "WV",
+    "WY",
+    "DC",
   ]);
   const token = String(row.state || "").trim();
   let country = "";
@@ -24,11 +89,11 @@ function deriveGeo(row: any) {
     // leave empty
   } else if (US.has(token)) {
     country = "US";
-    market  = token;
+    market = token;
   } else if (/^[A-Z]{2}-.+/.test(token)) {
     const [cc, rest] = token.split("-", 2);
     country = cc;
-    market  = rest;
+    market = rest;
   } else if (/^[A-Z]{2}$/.test(token)) {
     country = token;
   } else {
@@ -47,7 +112,7 @@ async function fetchAllRows(fromDateISO = "2024-01-01") {
     const { data, error } = await supabase
       .from(TABLE)
       .select(
-        "order_date,year,quarter,month,region,state,channel,product_category,product_name,revenue,units,cogs"
+        "order_date,year,quarter,month,region,state,channel,product_category,product_name,revenue,units,cogs",
       )
       .gte("order_date", fromDateISO)
       .order("order_date", { ascending: true })
@@ -70,20 +135,46 @@ const distinct = (arr: any[], key: string) =>
 export async function POST(req: NextRequest) {
   const { spec }: { spec: QuerySpec } = await req.json();
 
+  // Ensure filters is an array
+  if (!Array.isArray(spec.filters)) spec.filters = [];
+
+  // Expand shorthand values for region filters so "Asia" works
+  spec.filters = spec.filters.map((f: any) => {
+    if (f.field === "region") {
+      if (f.op === "eq" && typeof f.value === "string") {
+        return { ...f, op: "in", value: expandRegionShorthand(f.value) };
+      }
+      if (f.op === "in") {
+        const arr = Array.isArray(f.value) ? f.value : [f.value];
+        return { ...f, value: arr.flatMap(expandRegionShorthand) };
+      }
+    }
+    return f;
+  });
+
   try {
     // 1) Fetch raw rows (paginated) and derive geo
     const raw = await fetchAllRows("2024-01-01"); // your current dataset scope
+    console.log(
+      "REGIONS:",
+      Array.from(new Set(raw.map((r) => r.region))).sort(),
+    );
+
     for (const r of raw) {
       const { country, market } = deriveGeo(r);
       (r as any).country = country;
-      (r as any).market  = market;
+      (r as any).market = market;
     }
 
     // 2) Aggregate according to spec
     //    Supported: grain = year|quarter|month
     //    Dimension(s): region | country | market | channel | product_category | sales_rep (if present in your table)
     const timeKey =
-      spec.grain === "year" ? "year" : spec.grain === "quarter" ? "quarter" : "month";
+      spec.grain === "year"
+        ? "year"
+        : spec.grain === "quarter"
+          ? "quarter"
+          : "month";
 
     // Apply basic filters from spec (optional; make sure your QuerySpec supports these)
     const passesFilter = (row: any) => {
@@ -101,7 +192,8 @@ export async function POST(req: NextRequest) {
             return Number(v) <= Number(f.value);
           case "between":
             return Array.isArray(f.value) && f.value.length === 2
-              ? Number(v) >= Number(f.value[0]) && Number(v) <= Number(f.value[1])
+              ? Number(v) >= Number(f.value[0]) &&
+                  Number(v) <= Number(f.value[1])
               : true;
           default:
             return true;
@@ -131,7 +223,8 @@ export async function POST(req: NextRequest) {
       if (spec.grain === "quarter") parts.push(bucket.year, bucket.quarter);
       if (spec.grain === "month") parts.push(bucket.year, bucket.month);
 
-      for (const d of spec.dimensions || []) parts.push(bucket[d as keyof typeof bucket]);
+      for (const d of spec.dimensions || [])
+        parts.push(bucket[d as keyof typeof bucket]);
 
       const key = JSON.stringify(parts);
       const cur = groups.get(key) || {
@@ -149,7 +242,7 @@ export async function POST(req: NextRequest) {
           ? Number(r.units || 0)
           : spec.metric === "gross_margin_pct"
             ? // simple GM% proxy: (revenue - cogs) / revenue aggregated (guard div-by-zero)
-            Number(r.revenue || 0) > 0
+              Number(r.revenue || 0) > 0
               ? (Number(r.revenue) - Number(r.cogs || 0)) / Number(r.revenue)
               : 0
             : Number(r.revenue || 0);
@@ -163,9 +256,9 @@ export async function POST(req: NextRequest) {
 
     const rows = Array.from(groups.values()).sort(
       (a, b) =>
-        (a.year - b.year) ||
-        ((a.quarter || 0) - (b.quarter || 0)) ||
-        ((a.month || 0) - (b.month || 0))
+        a.year - b.year ||
+        (a.quarter || 0) - (b.quarter || 0) ||
+        (a.month || 0) - (b.month || 0),
     );
 
     // 3) Primary chart config (you can return alternates if you want)
@@ -176,7 +269,7 @@ export async function POST(req: NextRequest) {
       y: "value",
       series: spec.dimensions?.[0], // if present, makes a multi-series line
       title: `${spec.metric} by ${spec.dimensions?.[0] || timeKey} (${spec.grain})`,
-      data: rows
+      data: rows,
     };
     const charts: ChartConfig[] = [primary];
 
