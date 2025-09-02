@@ -162,33 +162,125 @@ export async function POST(req: NextRequest) {
 
   let spec: QuerySpec;
   try {
-    /*spec =
-      PROVIDER === "anthropic" ? await callAnthropic(q) : await callOpenAI(q);*/
-
-    spec = {
-      metric: "revenue",
-      grain: "quarter",
-      dimensions: ["region"],
-      filters: [
-        {
-          field: "region",
-          op: "in",
-          value: ["Asia"],
-        },
-      ],
-      time_range: {
-        preset: "last_2_years",
-      },
-      assumptions: [],
-    };
+    spec =
+      PROVIDER === "anthropic" ? await callAnthropic(q) : await callOpenAI(q);
   } catch (e) {
     spec = ruleFallback(q);
   }
 
-  // Minimal validation: ensure enums are respected, else fallback
+  // --- Validation & normalization ---
+  // 1. Ensure filters is always an array
+  if (!Array.isArray(spec.filters)) {
+    spec.filters = [];
+  }
+
+  // 2. Expand shorthand region names
+  // --- Region expansion helper ---
+  function expandRegion(value: string): string[] {
+    const v = value.toLowerCase();
+
+    // Asia-Pacific variants
+    if (v === "asia" || v === "apac" || v === "asia pacific") {
+      return ["Greater China", "Japan", "Rest of Asia Pacific"];
+    }
+
+    // Europe shorthand
+    if (v === "europe" || v === "eu") {
+      return ["UK", "NL", "SE", "DE", "FR", "IT", "ES"];
+      // ↑ list the country codes you actually use in your dataset
+    }
+
+    // Americas shorthand
+    if (v === "americas" || v === "na" || v === "latam") {
+      return ["US", "CA", "MX", "BR", "AR", "CL"];
+      // ↑ again, tailor this list to match the values in your data
+    }
+
+    // US as a country → all 50 states
+    if (v === "us" || v === "usa" || v === "united states") {
+      return [
+        "AL",
+        "AK",
+        "AZ",
+        "AR",
+        "CA",
+        "CO",
+        "CT",
+        "DE",
+        "FL",
+        "GA",
+        "HI",
+        "IA",
+        "ID",
+        "IL",
+        "IN",
+        "KS",
+        "KY",
+        "LA",
+        "MA",
+        "MD",
+        "ME",
+        "MI",
+        "MN",
+        "MO",
+        "MS",
+        "MT",
+        "NC",
+        "ND",
+        "NE",
+        "NH",
+        "NJ",
+        "NM",
+        "NV",
+        "NY",
+        "OH",
+        "OK",
+        "OR",
+        "PA",
+        "RI",
+        "SC",
+        "SD",
+        "TN",
+        "TX",
+        "UT",
+        "VA",
+        "VT",
+        "WA",
+        "WI",
+        "WV",
+        "WY",
+        "DC",
+      ];
+    }
+
+    // Catch-all → return the literal value unchanged
+    return [value];
+  }
+
+  if (spec.filters) {
+    spec.filters = spec.filters.map((f) => {
+      if (f.field === "region" && f.op === "in") {
+        const arr = Array.isArray(f.value) ? f.value : [f.value];
+        return { ...f, value: arr.flatMap(expandRegion) };
+      }
+      if (
+        f.field === "region" &&
+        f.op === "eq" &&
+        typeof f.value === "string"
+      ) {
+        return { ...f, op: "in", value: expandRegion(f.value) };
+      }
+      return f;
+    });
+  }
+
+  // 3. Validate enums
   const validMetric = ["revenue", "units", "gross_margin_pct"].includes(
     spec.metric as any,
   );
-  if (!validMetric) spec = ruleFallback(q);
+  if (!validMetric) {
+    spec = ruleFallback(q);
+  }
+
   return NextResponse.json({ spec, mode });
 }

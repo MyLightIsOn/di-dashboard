@@ -1,163 +1,189 @@
-import type { QuerySpec } from "@/types";
+import { NextRequest, NextResponse } from "next/server";
 
+// ---- Allowed vocab the LLM must target ----
+const METRICS = ["revenue", "units", "gross_margin_pct"] as const;
+const GRAINS = ["year", "quarter", "month"] as const;
 /**
- * Metrics available to the LLM + compiler.
- * Keep exprs simple aggregates so pushdown works in SQL.
+ * Semantic dimensions (must match your dataset route + semantics.ts):
+ * - region, channel, product_category, sales_rep (physical columns)
+ * - country, market (derived from `state`)
  */
-export const metrics = {
-  revenue: { expr: "SUM(revenue)", fmt: "currency" },
-  units: { expr: "SUM(units)", fmt: "integer" },
-  gross_margin_pct: {
-    expr: "(SUM(revenue)-SUM(cogs)) / NULLIF(SUM(revenue),0)",
-    fmt: "percent",
-  },
-} as const;
+const DIMS = [
+  "region",
+  "channel",
+  "product_category",
+  "sales_rep",
+  "country",
+  "market",
+] as const;
 
-/**
- * Canonical semantic dimensions.
- * country/market are derived from "state" using Postgres regex + split_part.
- *
- * - US state two-letter codes  → country='US', market=<state>
- * - CC-City (e.g., CN-Shanghai)→ country='CN', market='Shanghai'
- * - CC only (e.g., UK/JP/NL)   → country='UK'
- */
-export const dims = {
-  region: "region",
-  channel: "channel",
-  product_category: "product_category",
-  sales_rep: "sales_rep",
+type Metric = (typeof METRICS)[number];
+type Grain = (typeof GRAINS)[number];
+type Dim = (typeof DIMS)[number];
 
-  country: `
-    CASE
-      WHEN state ~ '^[A-Z]{2}$' AND state IN ('AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','IA','ID','IL','IN','KS','KY','LA','MA','MD','ME','MI','MN','MO','MS','MT','NC','ND','NE','NH','NJ','NM','NV','NY','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VA','VT','WA','WI','WV','WY','DC') THEN 'US'
-      WHEN state ~ '^[A-Z]{2}-' THEN split_part(state,'-',1)
-      WHEN state ~ '^[A-Z]{2}$' THEN state
-      ELSE NULL
-    END
-  `,
+type Filter =
+  | {
+      field: Dim | "year" | "quarter" | "month";
+      op: "eq";
+      value: string | number;
+    }
+  | {
+      field: Dim | "year" | "quarter" | "month";
+      op: "in";
+      value: (string | number)[];
+    }
+  | {
+      field: Dim | "year" | "quarter" | "month";
+      op: "between";
+      value: [number | string, number | string];
+    }
+  | {
+      field: Dim | "year" | "quarter" | "month";
+      op: "gte";
+      value: number | string;
+    }
+  | {
+      field: Dim | "year" | "quarter" | "month";
+      op: "lte";
+      value: number | string;
+    };
 
-  market: `
-    CASE
-      WHEN state ~ '^[A-Z]{2}$' AND state IN ('AL','AK','AZ','AR','CA','CO','CT','DE','FL','GA','HI','IA','ID','IL','IN','KS','KY','LA','MA','MD','ME','MI','MN','MO','MS','MT','NC','ND','NE','NH','NJ','NM','NV','NY','OH','OK','OR','PA','RI','SC','SD','TN','TX','UT','VA','VT','WA','WI','WV','WY','DC') THEN state
-      WHEN state ~ '^[A-Z]{2}-' THEN split_part(state,'-',2)
-      ELSE NULL
-    END
-  `,
-} as const;
-
-export const defaults = {
-  time_range: "last_2_years",
-  grain: "quarter" as const,
+export type QuerySpec = {
+  metric: Metric;
+  grain: Grain;
+  dimensions: Dim[]; // up to 2 for now
+  filters?: Filter[];
+  time_range?: { preset?: "last_2_years"; from?: string; to?: string };
 };
 
-/** Small helper to escape string literals safely (very basic) */
-function sqlLiteral(val: unknown): string {
-  if (val == null) return "NULL";
-  if (typeof val === "number") return String(val);
-  if (typeof val === "boolean") return val ? "TRUE" : "FALSE";
-  // simple quote escape for strings
-  return `'${String(val).replace(/'/g, "''")}'`;
-}
+// ---- Model plumbing (OpenAI shown; swap to Anthropic if you prefer) ----
+const PROVIDER = process.env.LLM_PROVIDER || "openai";
+const MODEL =
+  process.env.LLM_MODEL ||
+  (PROVIDER === "openai" ? "gpt-4o-mini" : "claude-3-5-sonnet-20240620");
 
-/** Map a spec field to a SQL expression (handles derived dims) */
-function fieldExpr(field: string): string {
-  // time grain fields are physical columns
-  if (field === "year" || field === "quarter" || field === "month")
-    return field;
+export async function POST(req: NextRequest) {
+  const { q } = await req.json(); // natural language question
 
-  // semantic dims
-  const d = (dims as Record<string, string>)[field];
-  if (d) return `(${d})`;
+  const system = [
+    "You convert a business question into a structured query spec for an internal sales dashboard.",
+    "You MUST output valid JSON only.",
+    "Choose from the provided metric, grain, and dimensions. Do not invent new fields.",
+    "Prefer at most one dimension; two is OK when the user clearly compares categories.",
+    "If the question mentions specific countries or markets (e.g., 'US', 'UK', 'CN-Shanghai'), map them to filters on 'country' or 'market'.",
+    "If the question is time-based (quarters or months), set an appropriate grain.",
+    "Default time_range.preset to 'last_2_years' unless the question specifies dates.",
+  ].join(" ");
 
-  // fall back to raw identifier (last resort)
-  return field;
-}
+  const schemaHint = {
+    metric: METRICS,
+    grain: GRAINS,
+    dimensions: DIMS,
+    filters_examples: [
+      { field: "country", op: "in", value: ["US", "UK", "JP"] },
+      { field: "market", op: "eq", value: "CN-Shanghai" }, // (you can also match just 'Shanghai' via market if your pre-processing supports it)
+      { field: "region", op: "eq", value: "Europe" },
+      { field: "product_category", op: "eq", value: "iPhone" },
+    ],
+  };
 
-/**
- * Compile a compact SQL statement matching the QuerySpec.
- * Uses positional GROUP BY for expressions (1,2,3...) to avoid repeating CASEs.
- */
-export function compileSql(spec: QuerySpec) {
-  const selectParts: string[] = [];
-  const aliases: string[] = []; // tracks the alias order for positional GROUP BY
+  const examples = [
+    {
+      user: "Show revenue by country in 2024 by quarter",
+      spec: {
+        metric: "revenue",
+        grain: "quarter",
+        dimensions: ["country"],
+        filters: [{ field: "year", op: "eq", value: 2024 }],
+        time_range: { preset: "last_2_years" },
+      },
+    },
+    {
+      user: "Compare US vs UK vs JP revenue this year",
+      spec: {
+        metric: "revenue",
+        grain: "quarter",
+        dimensions: ["country"],
+        filters: [
+          { field: "country", op: "in", value: ["US", "UK", "JP"] },
+          { field: "year", op: "eq", value: 2024 },
+        ],
+        time_range: { preset: "last_2_years" },
+      },
+    },
+    {
+      user: "Composition of revenue by product category in Europe by quarter",
+      spec: {
+        metric: "revenue",
+        grain: "quarter",
+        dimensions: ["product_category"],
+        filters: [{ field: "region", op: "eq", value: "Europe" }],
+        time_range: { preset: "last_2_years" },
+      },
+    },
+    {
+      user: "Top 5 markets by units for iPhone in Q2 2024",
+      spec: {
+        metric: "units",
+        grain: "quarter",
+        dimensions: ["market"],
+        filters: [
+          { field: "product_category", op: "eq", value: "iPhone" },
+          { field: "year", op: "eq", value: 2024 },
+          { field: "quarter", op: "eq", value: 2 },
+        ],
+        time_range: { preset: "last_2_years" },
+      },
+    },
+  ];
 
-  // 1) time grain
-  if (spec.grain === "year") {
-    selectParts.push("year AS year");
-    aliases.push("year");
-  } else if (spec.grain === "quarter") {
-    selectParts.push("year AS year", "quarter AS quarter");
-    aliases.push("year", "quarter");
-  } else {
-    selectParts.push("year AS year", "month AS month");
-    aliases.push("year", "month");
+  const prompt = JSON.stringify({
+    allowed: schemaHint,
+    examples,
+    instruction: "Return ONLY a JSON object matching QuerySpec.",
+    question: q,
+  });
+
+  try {
+    if (PROVIDER === "openai") {
+      const OpenAI = (await import("openai")).default;
+      const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+      const resp = await client.responses.create({
+        model: MODEL,
+        input: [
+          { role: "system", content: system },
+          { role: "user", content: prompt },
+        ],
+        //@ts-ignore
+        response_format: { type: "json_object" },
+      });
+      const text = resp.output_text || "{}";
+      const spec = JSON.parse(text) as QuerySpec;
+
+      // (Option A) Just return the spec; let the client call /api/dataset
+      return NextResponse.json({ spec });
+
+      // (Option B) If you want to chain the dataset call server-side:
+      // const agg = await fetch(new URL("/api/dataset", req.url), {
+      //   method: "POST",
+      //   headers: { "content-type": "application/json" },
+      //   body: JSON.stringify({ spec }),
+      // }).then(r => r.json());
+      // return NextResponse.json(agg);
+    } else {
+      const Anthropic = (await import("@anthropic-ai/sdk")).default;
+      const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+      const msg = await client.messages.create({
+        model: MODEL,
+        max_tokens: 400,
+        system,
+        messages: [{ role: "user", content: [{ type: "text", text: prompt }] }],
+      });
+      const text = (msg.content?.[0] as any)?.text || "{}";
+      const spec = JSON.parse(text) as QuerySpec;
+      return NextResponse.json({ spec });
+    }
+  } catch (e: any) {
+    return NextResponse.json({ error: e.message }, { status: 500 });
   }
-
-  // 2) dimensions (alias each expression to its dim name)
-  for (const d of spec.dimensions || []) {
-    const expr = fieldExpr(d);
-    selectParts.push(`${expr} AS ${d}`);
-    aliases.push(d);
-  }
-
-  // 3) metric (always last)
-  const met = (metrics as Record<string, { expr: string }>)[spec.metric];
-  if (!met) throw new Error(`Unknown metric: ${spec.metric}`);
-  selectParts.push(`${met.expr} AS value`);
-
-  // 4) filters → WHERE
-  const where: string[] = [];
-
-  // preset time range (calendar years)
-  if (
-    spec.time_range?.preset === "last_2_years" ||
-    defaults.time_range === "last_2_years"
-  ) {
-    // include current and prior year
-    where.push("year >= EXTRACT(YEAR FROM CURRENT_DATE) - 1");
-  } else if (spec.time_range?.from || spec.time_range?.to) {
-    // optional explicit dates if you add them to QuerySpec
-    if (spec.time_range?.from)
-      where.push(`order_date >= ${sqlLiteral(spec.time_range.from)}`);
-    if (spec.time_range?.to)
-      where.push(`order_date <= ${sqlLiteral(spec.time_range.to)}`);
-  }
-
-  for (const f of spec.filters || []) {
-    const lhs = fieldExpr(String(f.field));
-    if (f.op === "eq") {
-      where.push(`${lhs} = ${sqlLiteral(f.value)}`);
-    }
-    if (f.op === "in") {
-      const arr = Array.isArray(f.value) ? f.value : [f.value];
-      const list = arr.map(sqlLiteral).join(",");
-      where.push(`${lhs} IN (${list})`);
-    }
-    if (f.op === "gte") {
-      where.push(`${lhs} >= ${sqlLiteral(f.value)}`);
-    }
-    if (f.op === "lte") {
-      where.push(`${lhs} <= ${sqlLiteral(f.value)}`);
-    }
-    if (f.op === "between" && Array.isArray(f.value) && f.value.length === 2) {
-      const [a, b] = f.value;
-      where.push(`${lhs} BETWEEN ${sqlLiteral(a)} AND ${sqlLiteral(b)}`);
-    }
-  }
-
-  // 5) GROUP BY positions (exclude the metric which is last)
-  // positions are 1..N where N = number of select items prior to metric
-  const groupCount = selectParts.length - 1;
-  const groupBy = Array.from({ length: groupCount }, (_, i) =>
-    String(i + 1),
-  ).join(", ");
-
-  const sql =
-    `SELECT ${selectParts.join(", ")}\n` +
-    `FROM ${process.env.NEXT_PUBLIC_SUPABASE_TABLE}\n` +
-    (where.length ? `WHERE ${where.join(" AND ")}\n` : "") +
-    `GROUP BY ${groupBy}\n` +
-    `ORDER BY ${groupBy};`;
-
-  return sql;
 }
