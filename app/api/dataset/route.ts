@@ -176,6 +176,7 @@ export async function POST(req: NextRequest) {
       y: "value",
       series: spec.dimensions?.[0], // if present, makes a multi-series line
       title: `${spec.metric} by ${spec.dimensions?.[0] || timeKey} (${spec.grain})`,
+      data: rows
     };
     const charts: ChartConfig[] = [primary];
 
@@ -217,7 +218,7 @@ export async function POST(req: NextRequest) {
 
     return NextResponse.json({
       rows,
-      charts,
+      charts: [primary],
       insights,
       checks,
       kpis,

@@ -44,7 +44,10 @@ export function renderChart(config: ChartConfig, rows: any[]) {
     <>
       <CartesianGrid strokeDasharray="3 3" />
       <XAxis dataKey={config.x} />
-      <YAxis />
+      <XAxis
+        dataKey={config.x}
+        tickFormatter={(v) => String(v)} // or map 2024*10+q -> "2024 Qq"
+      />
       <Tooltip />
       <Legend />
     </>
@@ -52,21 +55,19 @@ export function renderChart(config: ChartConfig, rows: any[]) {
 
   switch (config.kind as ChartKey) {
     case "line": {
-      // Multi-series line: render one <Line> per series value
       if (config.series) {
-        const keys = distinct(rows, config.series);
+        const { wide, seriesVals } = pivotLongToWide(rows, config.x, config.series, config.y);
         return (
           <ResponsiveContainer width="100%" height={320}>
-            <LineChart>
+            <LineChart data={wide}>
               {commonAxes}
-              {keys.map((k) => (
+              {seriesVals.map((s) => (
                 <Line
-                  key={String(k)}
+                  key={String(s)}
                   type="monotone"
-                  name={String(k)}
-                  dataKey={config.y}
-                  data={rows.filter((r) => r[config.series!] === k)}
-                  dot={false}
+                  name={String(s)}
+                  dataKey={String(s)}   // <- each series now a column
+                  dot={true}
                   strokeWidth={2}
                 />
               ))}
@@ -74,43 +75,40 @@ export function renderChart(config: ChartConfig, rows: any[]) {
           </ResponsiveContainer>
         );
       }
-      // Single series
+      // single series stays the same
       return (
         <ResponsiveContainer width="100%" height={320}>
           <LineChart data={rows}>
             {commonAxes}
-            <Line type="monotone" dataKey={config.y} dot={false} strokeWidth={2} />
+            <Line type="monotone" dataKey={config.y} dot={true} strokeWidth={2} />
           </LineChart>
         </ResponsiveContainer>
       );
     }
 
-    case "bar": {
-      return (
-        <ResponsiveContainer width="100%" height={320}>
-          <BarChart data={rows}>
-            {commonAxes}
-            <Bar dataKey={config.y} />
-          </BarChart>
-        </ResponsiveContainer>
-      );
-    }
-
     case "stackedArea": {
-      // Expect a series dimension; each series stacked as part of total over time
-      const seriesField = config.series;
-      const seriesKeys = seriesField ? distinct(rows, seriesField) : [];
+      if (!config.series) {
+        // fall back to single-area on config.y if no series
+        return (
+          <ResponsiveContainer width="100%" height={320}>
+            <AreaChart data={rows}>
+              {commonAxes}
+              <Area type="monotone" dataKey={config.y} stackId="1" />
+            </AreaChart>
+          </ResponsiveContainer>
+        );
+      }
+      const { wide, seriesVals } = pivotLongToWide(rows, config.x, config.series, config.y);
       return (
         <ResponsiveContainer width="100%" height={320}>
-          <AreaChart>
+          <AreaChart data={wide}>
             {commonAxes}
-            {seriesKeys.map((k) => (
+            {seriesVals.map((s) => (
               <Area
-                key={String(k)}
+                key={String(s)}
                 type="monotone"
-                name={String(k)}
-                dataKey={config.y}
-                data={rows.filter((r) => r[seriesField!] === k)}
+                name={String(s)}
+                dataKey={String(s)}   // <- stacked columns
                 stackId="1"
               />
             ))}
@@ -189,3 +187,40 @@ export function renderChart(config: ChartConfig, rows: any[]) {
 function distinct(arr: any[], key: string) {
   return Array.from(new Set(arr.map((r) => r?.[key]).filter((v) => v != null)));
 }
+
+function pivotLongToWide(
+  rows: any[],
+  xKey: string,        // e.g., 'quarter' or 'period'
+  seriesKey: string,   // e.g., 'country'
+  yKey: string         // usually 'value'
+) {
+  // unique X values in order
+  const xVals = Array.from(new Set(rows.map(r => r?.[xKey])));
+
+  // unique series
+  const seriesVals = Array.from(new Set(rows.map(r => r?.[seriesKey])));
+
+  // index rows by (x, series) -> sum value
+  const cell = new Map<string, number>();
+  for (const r of rows) {
+    const x = r?.[xKey];
+    const s = r?.[seriesKey];
+    const v = Number(r?.[yKey] ?? 0);
+    if (x == null || s == null) continue;
+    const key = JSON.stringify([x, s]);
+    cell.set(key, (cell.get(key) || 0) + v);
+  }
+
+  // build wide rows: { [xKey]: <x>, [series1]: val, [series2]: val, ... }
+  const wide = xVals.map((x) => {
+    const obj: any = { [xKey]: x };
+    for (const s of seriesVals) {
+      const key = JSON.stringify([x, s]);
+      obj[s] = cell.get(key) || 0;
+    }
+    return obj;
+  });
+
+  return { wide, seriesVals };
+}
+
