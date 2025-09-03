@@ -3,6 +3,7 @@ import { supabase } from "@/lib/supabaseClient"; // <- make sure this exists
 import { computeChecks } from "@/lib/checks"; // uses your existing checks.ts
 import { buildInsights } from "@/lib/insights"; // uses your existing insights.ts
 import type { QuerySpec, ChartConfig } from "@/types";
+import { COUNTRY_CODES, US_STATE_CODES } from "@/app/api/ask/route";
 
 const TABLE = process.env.NEXT_PUBLIC_SUPABASE_TABLE || "sales_fact_rows";
 
@@ -19,6 +20,58 @@ function expandRegionShorthand(value: string): string[] {
     return ["Americas"]; // keep at your region granularity
   }
   return [value];
+}
+
+// reuse same constants as above (US_STATE_CODES, COUNTRY_CODES, expandRegionShorthand)
+// add these near the top of the file or import from a shared util if you prefer
+
+function normalizeDatasetFilters(filters: any[] = []) {
+  return filters.flatMap((f) => {
+    const op = f.op || "eq";
+    const vals = Array.isArray(f.value) ? f.value : [f.value];
+
+    if (f.field === "region") {
+      const expanded = vals.flatMap(expandRegionShorthand);
+      const looksLikeCountry = expanded.some((x) =>
+        COUNTRY_CODES.has(String(x).toUpperCase()),
+      );
+      const looksLikeState = expanded.some((x) =>
+        US_STATE_CODES.has(String(x).toUpperCase()),
+      );
+      if (looksLikeCountry)
+        return [{ ...f, field: "country", op: "in", value: expanded }];
+      if (looksLikeState)
+        return [{ ...f, field: "market", op: "in", value: expanded }];
+      return [{ ...f, op: "in", value: expanded }];
+    }
+
+    if (f.field === "country") {
+      const regionTerms = vals.flatMap(expandRegionShorthand);
+      const includedRegionWord = regionTerms.some((x) =>
+        [
+          "Europe",
+          "Americas",
+          "Greater China",
+          "Japan",
+          "Rest of Asia Pacific",
+        ].includes(String(x)),
+      );
+      if (includedRegionWord)
+        return [{ ...f, field: "region", op: "in", value: regionTerms }];
+      return [{ ...f, op, value: vals }];
+    }
+
+    if (f.field === "state" || f.field === "market") {
+      const looksLikeCountry = vals.some((x) =>
+        COUNTRY_CODES.has(String(x).toUpperCase()),
+      );
+      if (looksLikeCountry)
+        return [{ ...f, field: "country", op: "in", value: vals }];
+      return [{ ...f, field: "market", op, value: vals }];
+    }
+
+    return [{ ...f, op, value: vals }];
+  });
 }
 
 /**
@@ -137,6 +190,7 @@ export async function POST(req: NextRequest) {
 
   // Ensure filters is an array
   if (!Array.isArray(spec.filters)) spec.filters = [];
+  spec.filters = normalizeDatasetFilters(spec.filters);
 
   // Expand shorthand values for region filters so "Asia" works
   spec.filters = spec.filters.map((f: any) => {

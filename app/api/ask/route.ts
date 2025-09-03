@@ -7,6 +7,157 @@ const MODEL =
   process.env.LLM_MODEL ||
   (PROVIDER === "openai" ? "gpt-4o-mini" : "claude-3-5-sonnet-20240620");
 
+// Put these near the top of the file (module scope)
+export const US_STATE_CODES = new Set([
+  "AL",
+  "AK",
+  "AZ",
+  "AR",
+  "CA",
+  "CO",
+  "CT",
+  "DE",
+  "FL",
+  "GA",
+  "HI",
+  "IA",
+  "ID",
+  "IL",
+  "IN",
+  "KS",
+  "KY",
+  "LA",
+  "MA",
+  "MD",
+  "ME",
+  "MI",
+  "MN",
+  "MO",
+  "MS",
+  "MT",
+  "NC",
+  "ND",
+  "NE",
+  "NH",
+  "NJ",
+  "NM",
+  "NV",
+  "NY",
+  "OH",
+  "OK",
+  "OR",
+  "PA",
+  "RI",
+  "SC",
+  "SD",
+  "TN",
+  "TX",
+  "UT",
+  "VA",
+  "VT",
+  "WA",
+  "WI",
+  "WV",
+  "WY",
+  "DC",
+]);
+export const COUNTRY_CODES = new Set([
+  "US",
+  "UK",
+  "NL",
+  "SE",
+  "DE",
+  "FR",
+  "IT",
+  "ES",
+  "JP",
+  "CN",
+  "KR",
+  "IN",
+  "SG",
+  "CA",
+  "MX",
+  "BR",
+  "AR",
+  "CL",
+]); // tailor to your data
+const ASIA_ALIASES = new Set(["asia", "apac", "asia pacific"]);
+
+// Expand “Asia” etc. to your dataset’s region names
+function expandRegionShorthand(v: string): string[] {
+  const s = v.toLowerCase();
+  if (ASIA_ALIASES.has(s))
+    return ["Greater China", "Japan", "Rest of Asia Pacific"];
+  if (s === "europe" || s === "eu") return ["Europe"];
+  if (s === "americas" || s === "na" || s === "latam") return ["Americas"];
+  return [v];
+}
+
+// If a filter is on the wrong field, retarget it (region → country / market)
+function normalizeFilters(filters: any[] = []) {
+  return filters.flatMap((f) => {
+    // Normalize shape
+    const op = f.op || "eq";
+    const vals = Array.isArray(f.value) ? f.value : [f.value];
+
+    // 1) Region shorthands: "Asia" → real region names
+    if (f.field === "region") {
+      const expanded = vals.flatMap(expandRegionShorthand);
+      // BUT if user actually supplied country codes under "region", retarget to country
+      const looksLikeCountry = expanded.some((x) =>
+        COUNTRY_CODES.has(String(x).toUpperCase()),
+      );
+      const looksLikeState = expanded.some((x) =>
+        US_STATE_CODES.has(String(x).toUpperCase()),
+      );
+      if (looksLikeCountry) {
+        return [
+          { ...f, field: "country", op: "in", value: expanded.map(String) },
+        ];
+      }
+      if (looksLikeState) {
+        // They meant US states → retarget to market (derived from state)
+        return [
+          { ...f, field: "market", op: "in", value: expanded.map(String) },
+        ];
+      }
+      return [{ ...f, op: "in", value: expanded }];
+    }
+
+    // 2) Country filter accidentally using region terms like "Europe" → retarget to region
+    if (f.field === "country") {
+      const regionTerms = vals.flatMap(expandRegionShorthand);
+      const includedRegionWord = regionTerms.some((x) =>
+        [
+          "Europe",
+          "Americas",
+          "Greater China",
+          "Japan",
+          "Rest of Asia Pacific",
+        ].includes(String(x)),
+      );
+      if (includedRegionWord) {
+        return [{ ...f, field: "region", op: "in", value: regionTerms }];
+      }
+      return [{ ...f, op, value: vals }];
+    }
+
+    // 3) State/market anomalies: if they put states into "country", fix it
+    if (f.field === "state" || f.field === "market") {
+      const looksLikeCountry = vals.some((x) =>
+        COUNTRY_CODES.has(String(x).toUpperCase()),
+      );
+      if (looksLikeCountry) {
+        return [{ ...f, field: "country", op: "in", value: vals.map(String) }];
+      }
+      return [{ ...f, field: "market", op, value: vals }];
+    }
+
+    // Default passthrough
+    return [{ ...f, op, value: vals }];
+  });
+}
+
 // JSON schema we expect from the LLM
 const querySpecSchema = {
   type: "object",
@@ -172,6 +323,7 @@ export async function POST(req: NextRequest) {
   // 1. Ensure filters is always an array
   if (!Array.isArray(spec.filters)) {
     spec.filters = [];
+    spec.filters = normalizeFilters(spec.filters);
   }
 
   // 2. Expand shorthand region names
