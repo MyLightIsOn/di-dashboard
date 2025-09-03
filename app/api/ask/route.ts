@@ -83,6 +83,88 @@ export const COUNTRY_CODES = new Set([
 ]); // tailor to your data
 const ASIA_ALIASES = new Set(["asia", "apac", "asia pacific"]);
 
+const REGION_BUCKETS = [
+  "Americas",
+  "Europe",
+  "Greater China",
+  "Japan",
+  "Rest of Asia Pacific",
+];
+
+function normalizeFiltersAndDims(spec: QuerySpec) {
+  const filters = Array.isArray(spec.filters) ? spec.filters : [];
+  const dims = Array.isArray(spec.dimensions) ? spec.dimensions.slice() : [];
+
+  const normalized = filters.flatMap((f) => {
+    const op = f.op || "eq";
+    const values = Array.isArray(f.value) ? f.value : [f.value];
+
+    // If they put countries or US states under "region", retarget.
+    if (f.field === "region") {
+      // expand shorthands like "Asia" -> ["Greater China","Japan","Rest of Asia Pacific"]
+      const expanded = values.flatMap(expandRegionShorthand);
+
+      const hasCountryCodes = expanded.some((x) =>
+        COUNTRY_CODES.has(String(x).toUpperCase()),
+      );
+      const hasStateCodes = expanded.some((x) =>
+        US_STATE_CODES.has(String(x).toUpperCase()),
+      );
+      const allRegionBuckets = expanded.every((x) =>
+        REGION_BUCKETS.includes(String(x)),
+      );
+
+      if (hasStateCodes) {
+        // They meant states (markets) → retarget filter to 'market'
+        // and if the only dimension is 'region', switch to 'market' so the chart makes sense.
+        if (dims.length === 1 && dims[0] === "region") dims[0] = "market";
+        return [{ ...f, field: "market", op: "in", value: expanded }];
+      }
+      if (hasCountryCodes) {
+        // They meant country → retarget to 'country'
+        if (dims.length === 1 && dims[0] === "region") dims[0] = "country";
+        return [{ ...f, field: "country", op: "in", value: expanded }];
+      }
+      if (allRegionBuckets) {
+        // legit region terms; ensure "in" op
+        return [{ ...f, field: "region", op: "in", value: expanded }];
+      }
+      // fallback: treat them as region values
+      return [{ ...f, field: "region", op: "in", value: expanded }];
+    }
+
+    // If they put region words into 'country', flip to 'region'
+    if (f.field === "country") {
+      const regionTerms = values.flatMap(expandRegionShorthand);
+      const includesRegion = regionTerms.some((x) =>
+        REGION_BUCKETS.includes(String(x)),
+      );
+      if (includesRegion) {
+        if (dims.length === 1 && dims[0] === "country") dims[0] = "region";
+        return [{ ...f, field: "region", op: "in", value: regionTerms }];
+      }
+      return [{ ...f, op, value: values }];
+    }
+
+    // If they put country codes into 'state'/'market', flip to 'country'
+    if (f.field === "state" || f.field === "market") {
+      const hasCountryCodes = values.some((x) =>
+        COUNTRY_CODES.has(String(x).toUpperCase()),
+      );
+      if (hasCountryCodes) {
+        if (dims.length === 1 && dims[0] === "market") dims[0] = "country";
+        return [{ ...f, field: "country", op: "in", value: values }];
+      }
+    }
+
+    return [{ ...f, op, value: values }];
+  });
+
+  spec.filters = normalized;
+  spec.dimensions = dims;
+  return spec;
+}
+
 // Expand “Asia” etc. to your dataset’s region names
 function expandRegionShorthand(v: string): string[] {
   const s = v.toLowerCase();
@@ -321,10 +403,9 @@ export async function POST(req: NextRequest) {
 
   // --- Validation & normalization ---
   // 1. Ensure filters is always an array
-  if (!Array.isArray(spec.filters)) {
-    spec.filters = [];
-    spec.filters = normalizeFilters(spec.filters);
-  }
+  if (!Array.isArray(spec.filters)) spec.filters = [];
+  if (!Array.isArray(spec.dimensions)) spec.dimensions = [];
+  spec = normalizeFiltersAndDims(spec);
 
   // 2. Expand shorthand region names
   // --- Region expansion helper ---
